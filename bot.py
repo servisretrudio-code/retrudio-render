@@ -5,15 +5,20 @@ import logging
 import random
 import string
 import html
+import json
+import hashlib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardRemove, FSInputFile
+from aiogram.types import (
+    Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardRemove, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # Включаем логирование
@@ -37,6 +42,7 @@ ADMIN_IDS = [5025390367, 8221414112]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
+PROUSER_PATH = os.path.join(BASE_DIR, "prouser.json")  # необработанные платежи
 SCHEMS_DIR = os.path.join(BASE_DIR, "Schems")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -168,6 +174,7 @@ async def cmd_help(message: Message):
         "/status — проверить статус подписки\n"
         "/change_password — сменить пароль\n"
         "/stop_subscription — отменить подписку\n"
+        "/support — написать в поддержку\n"
         "/help — это сообщение"
     )
 
@@ -365,18 +372,162 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
     await pre_checkout_query.answer(ok=True)
 
 
+# --- Необработанные платежи: prouser.json ---
+# Формат записи: {"id_PAYMENT": "...", "user_email": "...", "status": "anticipation" | "success"}
+
+def get_admin_ids() -> set:
+    ids = set(ADMIN_IDS)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_id FROM users WHERE is_admin=1 AND telegram_id IS NOT NULL")
+        ids |= {row[0] for row in cursor.fetchall()}
+        conn.close()
+    except Exception as e:
+        logger.error(f"Не удалось получить админов из БД: {e}")
+    return ids
+
+
+def get_user_email(user_id_db) -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT email FROM users WHERE id=?", (user_id_db,)).fetchone()
+        conn.close()
+        return (row[0] if row and row[0] else "unknown")
+    except Exception:
+        return "unknown"
+
+
+def load_prouser() -> list:
+    try:
+        with open(PROUSER_PATH, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except FileNotFoundError:
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        raise ValueError("ожидался список")
+    except Exception as e:
+        # Не затираем повреждённый файл — сохраняем копию
+        backup = PROUSER_PATH + f".broken-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        try:
+            os.replace(PROUSER_PATH, backup)
+        except Exception:
+            pass
+        logger.error(f"prouser.json повреждён ({e}), копия: {backup}")
+        return []
+
+
+def save_prouser(records: list):
+    tmp = PROUSER_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROUSER_PATH)
+
+
+def pay_key(payment_id) -> str:
+    # callback_data в Telegram ограничен 64 байтами, поэтому используем короткий хеш
+    return hashlib.sha1(str(payment_id).encode("utf-8")).hexdigest()[:16]
+
+
+def format_payment_alert(rec: dict) -> str:
+    return (
+        f'Ошибка платежа! id_PAYMENT: "{esc(rec.get("id_PAYMENT", ""))}", '
+        f'user_email: "{esc(rec.get("user_email", ""))}", '
+        f'status: {esc(rec.get("status", ""))}'
+    )
+
+
+def payment_keyboard(rec: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Успешно", callback_data=f"paydone:{pay_key(rec.get('id_PAYMENT', ''))}")
+    ]])
+
+
+async def report_failed_payment(charge_id: str, user_id_db):
+    """Записывает неудавшуюся выдачу подписки в prouser.json и уведомляет админов."""
+    email = get_user_email(user_id_db) if user_id_db else "unknown"
+    rec = {"id_PAYMENT": charge_id, "user_email": email, "status": "anticipation"}
+
+    try:
+        records = load_prouser()
+        if any(r.get("id_PAYMENT") == charge_id for r in records):
+            logger.info(f"Платёж {charge_id} уже есть в prouser.json")
+            return
+        records.append(rec)
+        save_prouser(records)
+    except Exception as e:
+        logger.error(f"Не удалось записать prouser.json: {e}")
+
+    for admin_id in get_admin_ids():
+        try:
+            await bot.send_message(admin_id, "🚨 " + format_payment_alert(rec), reply_markup=payment_keyboard(rec))
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("paydone:"))
+async def cb_payment_done(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав.", show_alert=True)
+        return
+
+    key = callback.data.split(":", 1)[1]
+    try:
+        records = load_prouser()
+        rec = next((r for r in records if pay_key(r.get("id_PAYMENT", "")) == key), None)
+        if not rec:
+            await callback.answer("Запись не найдена в prouser.json.", show_alert=True)
+            return
+        if rec.get("status") != "success":
+            rec["status"] = "success"
+            save_prouser(records)
+    except Exception as e:
+        logger.error(f"Ошибка обновления prouser.json: {e}")
+        await callback.answer("Ошибка записи файла, см. логи.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_text(
+            "✅ " + format_payment_alert(rec) + f"\n\nОтметил: {esc(callback.from_user.full_name)}"
+        )
+    except Exception:
+        pass
+    await callback.answer("Отмечено: success")
+
+
+@dp.message(Command("pending"))
+async def cmd_pending(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    pending = [r for r in load_prouser() if r.get("status") != "success"]
+    if not pending:
+        await message.answer("✅ Необработанных платежей нет.")
+        return
+    for rec in pending:
+        await message.answer("🚨 " + format_payment_alert(rec), reply_markup=payment_keyboard(rec))
+
+
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     payment_info = message.successful_payment
     payload = payment_info.invoice_payload
     stars_amount = payment_info.total_amount
-
     charge_id = payment_info.telegram_payment_charge_id
+
     try:
         user_id_db = int(payload.split("_")[-1])
     except Exception as e:
         logger.error(f"Не удалось распарсить payload: {e} (charge_id={charge_id})")
-        await message.answer(f"⚠️ Платёж получен, но не удалось его обработать. Напишите в поддержку, указав ID платежа: <code>{charge_id}</code>")
+        await report_failed_payment(charge_id, None)
+        await message.answer(
+            f"⚠️ Платёж получен, но подписка не активировалась автоматически. "
+            f"Администраторы уже уведомлены и выдадут её вручную.\nID платежа: <code>{esc(charge_id)}</code>"
+        )
         return
 
     conn = None
@@ -402,7 +553,19 @@ async def process_successful_payment(message: Message):
 
         conn.commit()
         conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка платежа: {e} (charge_id={charge_id}, user_id_db={user_id_db})")
+        if conn:
+            conn.close()
+        await report_failed_payment(charge_id, user_id_db)
+        await message.answer(
+            f"⚠️ Платёж получен, но подписка не активировалась автоматически. "
+            f"Администраторы уже уведомлены и выдадут её вручную.\nID платежа: <code>{esc(charge_id)}</code>"
+        )
+        return
 
+    # Подписка уже выдана — ошибка отправки сообщения не считается ошибкой платежа
+    try:
         await message.answer(
             f"🎉 <b>Спасибо за покупку!</b>\n\n"
             f"Подписка PRO активирована на 30 дней.\n"
@@ -411,10 +574,17 @@ async def process_successful_payment(message: Message):
             f"👉 {SITE_URL}"
         )
     except Exception as e:
-        logger.error(f"Ошибка платежа: {e} (charge_id={charge_id}, user_id_db={user_id_db})")
-        if conn:
-            conn.close()
-        await message.answer(f"⚠️ Платёж получен, но подписку активировать не удалось. Напишите в поддержку, указав ID платежа: <code>{charge_id}</code>")
+        logger.error(f"Не удалось отправить подтверждение оплаты: {e}")
+
+
+# --- Поддержка ---
+
+@dp.message(Command("support"))
+async def cmd_support(message: Message):
+    await message.answer(
+        "САППОРТ НЕ ДОСТУПЕН ЗДЕСЬ! Продолжите в одном из двух:\n"
+        "t.me/rahmatullohrobot — t.me/odilxojarobot"
+    )
 
 
 # --- Смена пароля и отмена подписки ---
@@ -535,7 +705,8 @@ async def cmd_admin_panel(message: Message):
         "• <code>/sms [текст]</code> — рассылка всем юзерам\n"
         "• <code>/smsadmin [текст]</code> — рассылка админам\n"
         "• <code>/setadmin [email]</code> — сделать админом\n"
-        "• <code>/rename [email] [новый_ник]</code> — поменять ник"
+        "• <code>/rename [email] [новый_ник]</code> — поменять ник\n"
+        "• <code>/pending</code> — необработанные платежи (prouser.json)"
     )
 
 
