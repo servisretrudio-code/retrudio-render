@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,7 +36,7 @@ try:
     SUBSCRIPTION_PRICE = int(os.getenv("SUBSCRIPTION_PRICE", "0"))
 except ValueError:
     SUBSCRIPTION_PRICE = 0
-SITE_URL = os.getenv("SITE_URL", "https://retrudio.com")
+SITE_URL = os.getenv("SITE_URL", "https://retrudio.space")
 
 # Список ID администраторов
 ADMIN_IDS = [5025390367, 8221414112]
@@ -889,31 +890,63 @@ async def cmd_resetpassword(message: Message):
     await message.answer(f"✅ Пароль для {esc(email)} сброшен.\nНовый пароль: <code>{new_pass}</code>")
 
 
+async def _send_one(tg_id: int, text: str, sem: asyncio.Semaphore) -> str:
+    """Отправка одного сообщения. Возвращает 'ok' / 'blocked' / 'failed'."""
+    async with sem:
+        for _ in range(3):
+            try:
+                await bot.send_message(tg_id, text)
+                return "ok"
+            except TelegramRetryAfter as e:
+                # Telegram просит притормозить — ждём ровно сколько надо и пробуем снова
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramForbiddenError:
+                return "blocked"  # юзер заблокировал бота
+            except Exception as e:
+                logger.warning(f"Не удалось отправить {tg_id}: {e}")
+                return "failed"
+        return "failed"
+
+
+async def _run_broadcast(admin_chat_id: int, tg_ids: list, text: str):
+    sem = asyncio.Semaphore(20)  # до 20 отправок одновременно (лимит Telegram ~30/сек)
+    results = await asyncio.gather(*(_send_one(i, text, sem) for i in tg_ids))
+    ok = results.count("ok")
+    blocked = results.count("blocked")
+    failed = results.count("failed")
+    await bot.send_message(
+        admin_chat_id,
+        f"✅ Рассылка готова.\n"
+        f"Доставлено: {ok}\n"
+        f"Заблокировали бота: {blocked}\n"
+        f"Ошибок: {failed}",
+    )
+
+
+_broadcast_tasks: set = set()
+
+
 @dp.message(Command("sms"))
 async def cmd_sms(message: Message):
     if not is_admin(message.from_user.id): return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
+    # html_text сохраняет переносы строк и форматирование (жирный, курсив, ссылки)
+    parts = (message.html_text or "").split(maxsplit=1)
+    if len(parts) < 2:
         await message.answer("⚠️ Использование: <code>/sms [текст]</code>")
         return
-    text = args[1]
+    text = f"📢 {parts[1]}"
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT telegram_id FROM users WHERE telegram_id IS NOT NULL")
-    users = cursor.fetchall()
+    tg_ids = [row[0] for row in cursor.fetchall()]
     conn.close()
 
-    success, failed = 0, 0
-    for row in users:
-        tg_id = row[0]
-        try:
-            await bot.send_message(tg_id, f"📢 <b>Рассылка от техподдержки:</b>\n\n{esc(text)}")
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-    await message.answer(f"✅ Рассылка завершена.\nДоставлено: {success}, ошибок: {failed}")
+    await message.answer(f"📤 Отправляю {len(tg_ids)} пользователям, скоро напишу итог.")
+    # Запускаем в фоне, чтобы бот не «зависал» на время рассылки
+    task = asyncio.create_task(_run_broadcast(message.chat.id, tg_ids, text))
+    _broadcast_tasks.add(task)
+    task.add_done_callback(_broadcast_tasks.discard)
 
 
 @dp.message(Command("smsadmin"))
