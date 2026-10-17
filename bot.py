@@ -815,6 +815,17 @@ async def process_confirm_password(message: Message, state: FSMContext):
         await state.set_state(None)
 
 
+def clear_subscription(user_id_db) -> int:
+    """Полностью убирает подписку (subscription_until = NULL). Возвращает число изменённых строк."""
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET subscription_until=NULL WHERE id=?", (user_id_db,))
+    changed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return changed
+
+
 @dp.message(Command("stop_subscription"))
 async def cmd_stop_subscription(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -823,12 +834,9 @@ async def cmd_stop_subscription(message: Message, state: FSMContext):
         await message.answer("⚠️ Сначала войдите в аккаунт: /login")
         return
     try:
-        conn = db_connect()
-        cursor = conn.cursor()
-        now_str = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
-        cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, user_id_db))
-        conn.commit()
-        conn.close()
+        if clear_subscription(user_id_db) != 1:
+            await message.answer("⚠️ Не удалось отменить подписку: аккаунт не найден.")
+            return
         await message.answer("🛑 <b>Подписка отменена.</b>")
     except Exception as e:
         logger.error(f"Ошибка: {e}")
@@ -1039,8 +1047,7 @@ async def cmd_cancelpro(message: Message):
             await message.answer("❌ Пользователь не найден.")
             return
         uid, tg_id = u[0], u[1]
-        now_str = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
-        cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, uid))
+        cursor.execute("UPDATE users SET subscription_until=NULL WHERE id=?", (uid,))
         conn.commit()
         conn.close()
     except Exception as e:
