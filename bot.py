@@ -4,9 +4,12 @@ import os
 import logging
 import random
 import string
+import html
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,7 +26,10 @@ load_dotenv()
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUBSCRIPTION_PRICE = os.getenv("SUBSCRIPTION_PRICE")
+try:
+    SUBSCRIPTION_PRICE = int(os.getenv("SUBSCRIPTION_PRICE", "0"))
+except ValueError:
+    SUBSCRIPTION_PRICE = 0
 SITE_URL = os.getenv("SITE_URL", "https://retrudio.com")
 
 # Список ID администраторов
@@ -34,7 +40,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 SCHEMS_DIR = os.path.join(BASE_DIR, "Schems")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "app.db")
+DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_DIR, "app.db")
 
 # Защита от брутфорса: {telegram_id: {"attempts": int, "blocked_until": datetime}}
 _login_attempts: dict = {}
@@ -42,8 +48,16 @@ MAX_ATTEMPTS = 5
 BLOCK_DURATION_MIN = 15   
 # -----------------
 
-bot = Bot(token=BOT_TOKEN, is_test=False)
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан. Добавьте его в файл .env: BOT_TOKEN=123456:ABC...")
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+
+def esc(value) -> str:
+    """Экранирование пользовательских данных для HTML parse_mode."""
+    return html.escape(str(value))
 
 
 class AuthStates(StatesGroup):
@@ -80,6 +94,7 @@ def init_db_columns():
         conn.close()
     except Exception as e:
         logger.error(f"Ошибка инициализации колонок БД: {e}")
+
 
 def is_admin(tg_id: int) -> bool:
     if tg_id in ADMIN_IDS:
@@ -131,7 +146,7 @@ def reset_attempts(tg_id: int):
 async def cmd_start(message: Message):
     docs_path = os.path.join(SCHEMS_DIR, "docs.html")
     caption_text = (
-        "📜 **Ознакомьтесь с правилами сервиса.**\n\n"
+        "📜 <b>Ознакомьтесь с правилами сервиса.</b>\n\n"
         "Если вы согласны с условиями использования, "
         "войдите в аккаунт командой: /login\n\n"
         "📋 Список команд: /help"
@@ -146,7 +161,7 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "📋 **Список команд:**\n\n"
+        "📋 <b>Список команд:</b>\n\n"
         "/start — начало работы\n"
         "/login — войти в аккаунт\n"
         "/buy — купить подписку (30 дней)\n"
@@ -154,13 +169,6 @@ async def cmd_help(message: Message):
         "/change_password — сменить пароль\n"
         "/stop_subscription — отменить подписку\n"
         "/help — это сообщение"
-    )
-
-@dp.message(Command("support"))
-async def cmd_support(message: Message):
-    await message.answer(
-        "САППОРТ НЕ ДОСТУПЕН ЗДЕСЬ! Продолжите в одном из двух:\n"
-        "t.me/rahmatullohrobot — t.me/odilxojarobot"
     )
 
 
@@ -191,22 +199,23 @@ async def cmd_status(message: Message, state: FSMContext):
             sub_dt = datetime.fromisoformat(sub_until)
             if sub_dt > now:
                 days_left = (sub_dt - now).days
-                status_text = f"✅ **Активна** до `{sub_until[:10]}` (осталось {days_left} дн.)"
+                status_text = f"✅ <b>Активна</b> до <code>{sub_until[:10]}</code> (осталось {days_left} дн.)"
             else:
-                status_text = "❌ **Истекла**"
+                status_text = "❌ <b>Истекла</b>"
         else:
-            status_text = "❌ **Нет подписки**"
+            status_text = "❌ <b>Нет подписки</b>"
 
         await message.answer(
-            f"👤 **Аккаунт:**\n"
-            f"• Имя: `{username or '—'}`\n"
-            f"• Email: `{email or '—'}`\n\n"
-            f"⭐ **Подписка:** {status_text}\n\n"
+            f"👤 <b>Аккаунт:</b>\n"
+            f"• Имя: <code>{esc(username or '—')}</code>\n"
+            f"• Email: <code>{esc(email or '—')}</code>\n\n"
+            f"⭐ <b>Подписка:</b> {status_text}\n\n"
             f"Купить/продлить: /buy"
         )
     except Exception as e:
         logger.error(f"Ошибка /status: {e}")
-        await message.answer(f"⚠️ Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
 
 
 # --- Авторизация и проверка статусов банов ---
@@ -216,24 +225,24 @@ async def cmd_login(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     blocked, mins = is_blocked_brute(tg_id)
     if blocked:
-        await message.answer(f"🚫 **Слишком много неудачных попыток.**\nПовторите через {mins} мин.")
+        await message.answer(f"🚫 <b>Слишком много неудачных попыток.</b>\nПовторите через {mins} мин.")
         return
 
     await message.answer(
-        "🔐 **Авторизация**\n\nВведите ваш **логин** или email от сайта:",
+        "🔐 <b>Авторизация</b>\n\nВведите ваш <b>логин</b> или email от сайта:",
         reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(AuthStates.waiting_for_login)
 
 
-@dp.message(AuthStates.waiting_for_login)
+@dp.message(AuthStates.waiting_for_login, F.text, ~F.text.startswith("/"))
 async def process_login(message: Message, state: FSMContext):
     await state.update_data(login=message.text)
-    await message.answer("🔑 Введите ваш **пароль**:")
+    await message.answer("🔑 Введите ваш <b>пароль</b>:")
     await state.set_state(AuthStates.waiting_for_password)
 
 
-@dp.message(AuthStates.waiting_for_password)
+@dp.message(AuthStates.waiting_for_password, F.text)
 async def process_password(message: Message, state: FSMContext):
     tg_id = message.from_user.id
 
@@ -249,7 +258,7 @@ async def process_password(message: Message, state: FSMContext):
     blocked, mins = is_blocked_brute(tg_id)
     if blocked:
         await state.clear()
-        await message.answer(f"🚫 **Слишком много неудачных попыток.**\nПовторите через {mins} мин.")
+        await message.answer(f"🚫 <b>Слишком много неудачных попыток.</b>\nПовторите через {mins} мин.")
         return
 
     password = message.text
@@ -272,14 +281,14 @@ async def process_password(message: Message, state: FSMContext):
             if status == 'perm_banned':
                 conn.close()
                 await state.clear()
-                await message.answer(f"🚫 **Ваш аккаунт заблокирован навсегда.**\nПричина: {ban_reason or 'Нарушение правил'}")
+                await message.answer(f"🚫 <b>Ваш аккаунт заблокирован навсегда.</b>\nПричина: {esc(ban_reason or 'Нарушение правил')}")
                 return
             elif status == 'banned' and banned_until:
                 banned_dt = datetime.fromisoformat(banned_until)
                 if banned_dt > datetime.utcnow():
                     conn.close()
                     await state.clear()
-                    await message.answer(f"🚫 **Ваш аккаунт заблокирован.**\nСрок: до {banned_until[:16]}\nПричина: {ban_reason or 'Нарушение правил'}")
+                    await message.answer(f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок: до {banned_until[:16]}\nПричина: {esc(ban_reason or 'Нарушение правил')}")
                     return
                 else:
                     cursor.execute("UPDATE users SET status='active', banned_until=NULL, ban_reason=NULL WHERE id=?", (user_id_db,))
@@ -296,18 +305,18 @@ async def process_password(message: Message, state: FSMContext):
                 await state.clear()
                 await state.update_data(user_id_db=user_id_db)
                 await message.answer(
-                    f"✅ **Вход выполнен!**\n"
-                    f"Привет, {display_name}!\n\n"
+                    f"✅ <b>Вход выполнен!</b>\n"
+                    f"Привет, {esc(display_name)}!\n\n"
                     f"• Статус подписки: /status\n"
                     f"• Купить подписку: /buy\n"
-                    f"• Сменить пароль: /change\\_password"
+                    f"• Сменить пароль: /change_password"
                 )
             else:
                 conn.close()
                 remaining = record_failed_attempt(tg_id)
                 if remaining == 0:
                     await state.clear()
-                    await message.answer(f"🚫 **Превышен лимит попыток.**\nАккаунт заблокирован на {BLOCK_DURATION_MIN} мин.")
+                    await message.answer(f"🚫 <b>Превышен лимит попыток.</b>\nАккаунт заблокирован на {BLOCK_DURATION_MIN} мин.")
                 else:
                     await message.answer(f"❌ Неверный пароль. Осталось попыток: {remaining}\nПопробуйте снова: /login")
                     await state.clear()
@@ -319,7 +328,8 @@ async def process_password(message: Message, state: FSMContext):
 
     except Exception as e:
         logger.error(f"Ошибка авторизации: {e}")
-        await message.answer(f"⚠️ Ошибка базы данных: {e}")
+        logger.error(f"Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
         await state.clear()
 
 
@@ -334,7 +344,12 @@ async def cmd_buy(message: Message, state: FSMContext):
         await message.answer("⚠️ Сначала войдите в аккаунт: /login")
         return
 
-    prices = [LabeledPrice(label="Подписка (30 дней)", amount=int(SUBSCRIPTION_PRICE))]
+    if SUBSCRIPTION_PRICE <= 0:
+        logger.error("SUBSCRIPTION_PRICE не задан или некорректен в .env")
+        await message.answer("⚠️ Оплата временно недоступна.")
+        return
+
+    prices = [LabeledPrice(label="Подписка (30 дней)", amount=SUBSCRIPTION_PRICE)]
     await message.answer_invoice(
         title="Оплата PRO-тарифа",
         description="Подписка на сайт сроком на 30 дней.",
@@ -356,12 +371,15 @@ async def process_successful_payment(message: Message):
     payload = payment_info.invoice_payload
     stars_amount = payment_info.total_amount
 
+    charge_id = payment_info.telegram_payment_charge_id
     try:
         user_id_db = int(payload.split("_")[-1])
     except Exception as e:
-        logger.error(f"Не удалось распарсить payload: {e}")
+        logger.error(f"Не удалось распарсить payload: {e} (charge_id={charge_id})")
+        await message.answer(f"⚠️ Платёж получен, но не удалось его обработать. Напишите в поддержку, указав ID платежа: <code>{charge_id}</code>")
         return
 
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -386,14 +404,17 @@ async def process_successful_payment(message: Message):
         conn.close()
 
         await message.answer(
-            f"🎉 **Спасибо за покупку!**\n\n"
+            f"🎉 <b>Спасибо за покупку!</b>\n\n"
             f"Подписка PRO активирована на 30 дней.\n"
             f"• Списано звезд: {stars_amount} ⭐\n"
-            f"• Активна до: `{new_sub_until[:10]}`\n\n"
+            f"• Активна до: <code>{new_sub_until[:10]}</code>\n\n"
             f"👉 {SITE_URL}"
         )
     except Exception as e:
-        logger.error(f"Ошибка платежа: {e}")
+        logger.error(f"Ошибка платежа: {e} (charge_id={charge_id}, user_id_db={user_id_db})")
+        if conn:
+            conn.close()
+        await message.answer(f"⚠️ Платёж получен, но подписку активировать не удалось. Напишите в поддержку, указав ID платежа: <code>{charge_id}</code>")
 
 
 # --- Смена пароля и отмена подписки ---
@@ -405,11 +426,11 @@ async def cmd_change_password(message: Message, state: FSMContext):
     if not user_id_db:
         await message.answer("⚠️ Сначала войдите в аккаунт: /login")
         return
-    await message.answer("🔑 Введите ваш **текущий пароль**:")
+    await message.answer("🔑 Введите ваш <b>текущий пароль</b>:")
     await state.set_state(ChangePasswordStates.waiting_for_old_password)
 
 
-@dp.message(ChangePasswordStates.waiting_for_old_password)
+@dp.message(ChangePasswordStates.waiting_for_old_password, F.text)
 async def process_old_password(message: Message, state: FSMContext):
     try:
         await message.delete()
@@ -424,17 +445,18 @@ async def process_old_password(message: Message, state: FSMContext):
         row = cursor.fetchone()
         conn.close()
         if not row or not (check_password_hash(row[0], message.text) or message.text == row[0]):
-            await message.answer("❌ Неверный текущий пароль. Попробуйте снова: /change\\_password")
+            await message.answer("❌ Неверный текущий пароль. Попробуйте снова: /change_password")
             await state.set_state(None)
             return
-        await message.answer("✅ Подтверждено.\n\n🔒 Введите **новый пароль** (минимум 6 символов):")
+        await message.answer("✅ Подтверждено.\n\n🔒 Введите <b>новый пароль</b> (минимум 6 символов):")
         await state.set_state(ChangePasswordStates.waiting_for_new_password)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
         await state.set_state(None)
 
 
-@dp.message(ChangePasswordStates.waiting_for_new_password)
+@dp.message(ChangePasswordStates.waiting_for_new_password, F.text)
 async def process_new_password(message: Message, state: FSMContext):
     try:
         await message.delete()
@@ -444,11 +466,11 @@ async def process_new_password(message: Message, state: FSMContext):
         await message.answer("❌ Пароль слишком короткий. Минимум 6 символов:")
         return
     await state.update_data(new_password=message.text)
-    await message.answer("🔒 Повторите **новый пароль**:")
+    await message.answer("🔒 Повторите <b>новый пароль</b>:")
     await state.set_state(ChangePasswordStates.waiting_for_confirm_password)
 
 
-@dp.message(ChangePasswordStates.waiting_for_confirm_password)
+@dp.message(ChangePasswordStates.waiting_for_confirm_password, F.text)
 async def process_confirm_password(message: Message, state: FSMContext):
     try:
         await message.delete()
@@ -456,7 +478,7 @@ async def process_confirm_password(message: Message, state: FSMContext):
         pass
     data = await state.get_data()
     if data.get("new_password") != message.text:
-        await message.answer("❌ Пароли не совпадают. Начните заново: /change\\_password")
+        await message.answer("❌ Пароли не совпадают. Начните заново: /change_password")
         await state.set_state(None)
         return
     try:
@@ -466,10 +488,11 @@ async def process_confirm_password(message: Message, state: FSMContext):
         cursor.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, data.get("user_id_db")))
         conn.commit()
         conn.close()
-        await message.answer("✅ **Пароль успешно изменен!**")
+        await message.answer("✅ <b>Пароль успешно изменен!</b>")
         await state.set_state(None)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
         await state.set_state(None)
 
 
@@ -487,9 +510,10 @@ async def cmd_stop_subscription(message: Message, state: FSMContext):
         cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, user_id_db))
         conn.commit()
         conn.close()
-        await message.answer("🛑 **Подписка отменена.**")
+        await message.answer("🛑 <b>Подписка отменена.</b>")
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
 
 
 # ==========================================
@@ -502,16 +526,16 @@ async def cmd_admin_panel(message: Message):
         await message.answer("❌ У вас нет прав администратора.")
         return
     await message.answer(
-        "🛠 **Панель технической поддержки (Admin):**\n\n"
-        "• `/permban [email] [причина]` — вечный бан\n"
-        "• `/ban [email] [срок_в_днях] [причина]` — временный бан\n"
-        "• `/givepro [email] [срок_в_днях] [за_что]` — выдать PRO тариф\n"
-        "• `/cancelpro [email] [причина]` — отменить PRO тариф\n"
-        "• `/resetpassword [email]` — сбросить пароль\n"
-        "• `/sms [текст]` — рассылка всем юзерам\n"
-        "• `/smsadmin [текст]` — рассылка админам\n"
-        "• `/setadmin [email]` — сделать админом\n"
-        "• `/rename [email] [новый_ник]` — поменять ник"
+        "🛠 <b>Панель технической поддержки (Admin):</b>\n\n"
+        "• <code>/permban [email] [причина]</code> — вечный бан\n"
+        "• <code>/ban [email] [срок_в_днях] [причина]</code> — временный бан\n"
+        "• <code>/givepro [email] [срок_в_днях] [за_что]</code> — выдать PRO тариф\n"
+        "• <code>/cancelpro [email] [причина]</code> — отменить PRO тариф\n"
+        "• <code>/resetpassword [email]</code> — сбросить пароль\n"
+        "• <code>/sms [текст]</code> — рассылка всем юзерам\n"
+        "• <code>/smsadmin [текст]</code> — рассылка админам\n"
+        "• <code>/setadmin [email]</code> — сделать админом\n"
+        "• <code>/rename [email] [новый_ник]</code> — поменять ник"
     )
 
 
@@ -520,7 +544,7 @@ async def cmd_permban(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: `/permban [email] [причина]`")
+        await message.answer("⚠️ Использование: <code>/permban [email] [причина]</code>")
         return
     email, reason = args[1], args[2]
 
@@ -539,9 +563,9 @@ async def cmd_permban(message: Message):
 
     if tg_id:
         try:
-            await bot.send_message(tg_id, f"🚫 **Ваш аккаунт заблокирован навсегда.**\nПричина: {reason}")
-        except: pass
-    await message.answer(f"✅ Пользователь {email} заблокирован навсегда.")
+            await bot.send_message(tg_id, f"🚫 <b>Ваш аккаунт заблокирован навсегда.</b>\nПричина: {esc(reason)}")
+        except Exception: pass
+    await message.answer(f"✅ Пользователь {esc(email)} заблокирован навсегда.")
 
 
 @dp.message(Command("ban"))
@@ -549,7 +573,7 @@ async def cmd_ban(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=3)
     if len(args) < 4:
-        await message.answer("⚠️ Использование: `/ban [email] [срок_в_днях] [причина]`")
+        await message.answer("⚠️ Использование: <code>/ban [email] [срок_в_днях] [причина]</code>")
         return
     email, days_str, reason = args[1], args[2], args[3]
     try:
@@ -574,9 +598,9 @@ async def cmd_ban(message: Message):
 
     if tg_id:
         try:
-            await bot.send_message(tg_id, f"🚫 **Ваш аккаунт заблокирован.**\nСрок до: {banned_until[:16]}\nПричина: {reason}")
-        except: pass
-    await message.answer(f"✅ Пользователь {email} заблокирован на {days} дней.")
+            await bot.send_message(tg_id, f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок до: {banned_until[:16]}\nПричина: {esc(reason)}")
+        except Exception: pass
+    await message.answer(f"✅ Пользователь {esc(email)} заблокирован на {days} дней.")
 
 
 @dp.message(Command("givepro"))
@@ -584,7 +608,7 @@ async def cmd_givepro(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=3)
     if len(args) < 4:
-        await message.answer("⚠️ Использование: `/givepro [email] [срок_в_днях] [за_что]`")
+        await message.answer("⚠️ Использование: <code>/givepro [email] [срок_в_днях] [за_что]</code>")
         return
     email, days_str, reason = args[1], args[2], args[3]
     try:
@@ -615,9 +639,9 @@ async def cmd_givepro(message: Message):
     sub_date_formatted = new_sub_until[:10]
     if tg_id:
         try:
-            await bot.send_message(tg_id, f"🎉 **Вам выдали тариф!**\nСрок истечения: {sub_date_formatted}\nПричина: {reason}")
-        except: pass
-    await message.answer(f"✅ Пользователю {email} выдан PRO тариф до {sub_date_formatted}.")
+            await bot.send_message(tg_id, f"🎉 <b>Вам выдали тариф!</b>\nСрок истечения: {sub_date_formatted}\nПричина: {esc(reason)}")
+        except Exception: pass
+    await message.answer(f"✅ Пользователю {esc(email)} выдан PRO тариф до {sub_date_formatted}.")
 
 
 @dp.message(Command("cancelpro"))
@@ -625,7 +649,7 @@ async def cmd_cancelpro(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: `/cancelpro [email] [причина]`")
+        await message.answer("⚠️ Использование: <code>/cancelpro [email] [причина]</code>")
         return
     email, reason = args[1], args[2]
 
@@ -645,9 +669,9 @@ async def cmd_cancelpro(message: Message):
 
     if tg_id:
         try:
-            await bot.send_message(tg_id, f"🛑 **Ваш PRO тариф был отменен.**\nПричина: {reason}")
-        except: pass
-    await message.answer(f"✅ PRO тариф пользователя {email} отменен.")
+            await bot.send_message(tg_id, f"🛑 <b>Ваш PRO тариф был отменен.</b>\nПричина: {esc(reason)}")
+        except Exception: pass
+    await message.answer(f"✅ PRO тариф пользователя {esc(email)} отменен.")
 
 
 @dp.message(Command("resetpassword"))
@@ -655,7 +679,7 @@ async def cmd_resetpassword(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: `/resetpassword [email]`")
+        await message.answer("⚠️ Использование: <code>/resetpassword [email]</code>")
         return
     email = args[1]
 
@@ -677,9 +701,9 @@ async def cmd_resetpassword(message: Message):
 
     if tg_id:
         try:
-            await bot.send_message(tg_id, f"🔑 **Ваш пароль был сброшен.**\nНовый временный пароль: `{new_pass}`")
-        except: pass
-    await message.answer(f"✅ Пароль для {email} сброшен.\nНовый пароль: `{new_pass}`")
+            await bot.send_message(tg_id, f"🔑 <b>Ваш пароль был сброшен.</b>\nНовый временный пароль: <code>{new_pass}</code>")
+        except Exception: pass
+    await message.answer(f"✅ Пароль для {esc(email)} сброшен.\nНовый пароль: <code>{new_pass}</code>")
 
 
 @dp.message(Command("sms"))
@@ -687,7 +711,7 @@ async def cmd_sms(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: `/sms [текст]`")
+        await message.answer("⚠️ Использование: <code>/sms [текст]</code>")
         return
     text = args[1]
 
@@ -701,10 +725,10 @@ async def cmd_sms(message: Message):
     for row in users:
         tg_id = row[0]
         try:
-            await bot.send_message(tg_id, f"📢 **Рассылка от техподдержки:**\n\n{text}")
+            await bot.send_message(tg_id, f"📢 <b>Рассылка от техподдержки:</b>\n\n{esc(text)}")
             success += 1
             await asyncio.sleep(0.05)
-        except:
+        except Exception:
             failed += 1
     await message.answer(f"✅ Рассылка завершена.\nДоставлено: {success}, ошибок: {failed}")
 
@@ -714,24 +738,23 @@ async def cmd_smsadmin(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: `/smsadmin [текст]`")
+        await message.answer("⚠️ Использование: <code>/smsadmin [текст]</code>")
         return
     text = args[1]
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT telegram_id FROM users WHERE is_admin=1 OR telegram_id IN (%s)" % ','.join(map(str, ADMIN_IDS)))
-    admins = cursor.fetchall()
+    cursor.execute("SELECT telegram_id FROM users WHERE is_admin=1 AND telegram_id IS NOT NULL")
+    admin_ids = {row[0] for row in cursor.fetchall()} | set(ADMIN_IDS)
     conn.close()
 
     success = 0
-    for row in admins:
-        tg_id = row[0]
-        if tg_id:
-            try:
-                await bot.send_message(tg_id, f"🛡 **Для админов:**\n\n{text}")
-                success += 1
-            except: pass
+    for tg_id in admin_ids:
+        try:
+            await bot.send_message(tg_id, f"🛡 <b>Для админов:</b>\n\n{esc(text)}")
+            success += 1
+        except Exception:
+            pass
     await message.answer(f"✅ Отправлено админам ({success}).")
 
 
@@ -740,7 +763,7 @@ async def cmd_setadmin(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: `/setadmin [email]`")
+        await message.answer("⚠️ Использование: <code>/setadmin [email]</code>")
         return
     email = args[1]
 
@@ -755,7 +778,7 @@ async def cmd_setadmin(message: Message):
     cursor.execute("UPDATE users SET is_admin=1 WHERE id=?", (u[0],))
     conn.commit()
     conn.close()
-    await message.answer(f"✅ Пользователь {email} теперь администратор.")
+    await message.answer(f"✅ Пользователь {esc(email)} теперь администратор.")
 
 
 @dp.message(Command("rename"))
@@ -763,7 +786,7 @@ async def cmd_rename(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: `/rename [email] [новый_ник]`")
+        await message.answer("⚠️ Использование: <code>/rename [email] [новый_ник]</code>")
         return
     email, new_name = args[1], args[2]
 
@@ -778,17 +801,21 @@ async def cmd_rename(message: Message):
     cursor.execute("UPDATE users SET username=? WHERE id=?", (new_name, u[0]))
     conn.commit()
     conn.close()
-    await message.answer(f"✅ Ник пользователя {email} изменен на `{new_name}`.")
+    await message.answer(f"✅ Ник пользователя {esc(email)} изменен на <code>{esc(new_name)}</code>.")
 
 
 # --- Запуск ---
 
 async def main():
-    init_db_columns()
     if os.path.exists(DB_PATH):
         logger.info(f"База данных найдена: {DB_PATH}")
+        init_db_columns()
     else:
-        logger.error(f"База данных НЕ НАЙДЕНА: {DB_PATH}")
+        logger.error(f"База данных НЕ НАЙДЕНА: {DB_PATH} — укажите правильный путь в .env (DB_PATH=...)")
+        return
+
+    # Если у бота ранее был включён вебхук, polling не будет получать сообщения
+    await bot.delete_webhook(drop_pending_updates=False)
 
     logger.info("Бот запущен...")
     await dp.start_polling(bot)
@@ -798,4 +825,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")s
+        logger.info("Бот остановлен.")
