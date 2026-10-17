@@ -49,6 +49,46 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ---------- helpers ----------
+def ban_info(user):
+    """Данные о бане или None, если пользователь не забанен.
+    Бан выставляет Telegram-бот в таблице users. Статусы бота:
+      'active'      — всё в порядке
+      'banned'      — временный бан (дата окончания в banned_until)
+      'perm_banned' — бан навсегда
+    Причина бана лежит в ban_reason."""
+    if not user:
+        return None
+    keys = user.keys()
+    status = user["status"] if "status" in keys else None
+    reason = (user["ban_reason"] if "ban_reason" in keys else None) or ""
+    if status == "perm_banned":
+        return {"until": None, "reason": reason}
+    if status == "banned":
+        until = user["banned_until"] if "banned_until" in keys else None
+        if not until:
+            return {"until": None, "reason": reason}
+        try:
+            if datetime.fromisoformat(until) <= utcnow():
+                return None          # срок бана истёк
+        except ValueError:
+            pass                     # непонятная дата — на всякий случай считаем бан действующим
+        return {"until": until, "reason": reason}
+    return None
+
+
+def ban_message(b, lang):
+    ru = lang == "ru"
+    if b["until"]:
+        when = b["until"][:16].replace("T", " ")
+        text = (f"Ваш аккаунт заблокирован до {when} (UTC)." if ru
+                else f"Your account is banned until {when} (UTC).")
+    else:
+        text = "Ваш аккаунт заблокирован навсегда." if ru else "Your account is permanently banned."
+    if b["reason"]:
+        text += (" Причина: " if ru else " Reason: ") + b["reason"]
+    return text
+
+
 @app.before_request
 def before():
     if request.args.get("lang") in config.LANGS:
@@ -57,6 +97,13 @@ def before():
     g.user = None
     if session.get("uid"):
         g.user = get_db().execute("SELECT * FROM users WHERE id=?", (session["uid"],)).fetchone()
+        b = ban_info(g.user)
+        if b:  # забаненного сразу выкидываем из аккаунта
+            g.user = None
+            session.pop("uid", None)
+            flash(ban_message(b, g.lang))
+            if request.endpoint != "static" and not request.path.startswith("/api/"):
+                return redirect(url_for("login"))
     if request.method in ("POST", "PUT", "DELETE") and request.endpoint not in ("payment_notify", "payment_success", "payment_fail"):
         token = request.form.get("csrf") or request.headers.get("X-CSRF-Token", "")
         if not hmac.compare_digest(token, session.get("csrf", "")):
@@ -342,6 +389,10 @@ def login():
         email = request.form.get("email", "").strip().lower()
         row = get_db().execute("SELECT * FROM users WHERE email=? OR username=?", (email, email)).fetchone()
         if row and check_password_hash(row["password_hash"], request.form.get("password", "")):
+            b = ban_info(row)
+            if b:  # пароль верный, но аккаунт в бане — в аккаунт не пускаем
+                flash(ban_message(b, g.lang))
+                return render_template("auth.html", mode="login")
             lang = session.get("lang")
             session.clear()
             session["uid"] = row["id"]
