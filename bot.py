@@ -9,7 +9,7 @@ import json
 import hashlib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -96,11 +96,45 @@ def init_db_columns():
             cursor.execute("ALTER TABLE users ADD COLUMN ban_reason TEXT")
         if "is_admin" not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-            
+
+        # Все, кто хоть раз писал боту (в том числе без регистрации на сайте) — для рассылки
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS bot_chats ("
+            "telegram_id INTEGER PRIMARY KEY, "
+            "first_seen TEXT)"
+        )
+
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"Ошибка инициализации колонок БД: {e}")
+
+
+def register_chat(tg_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_chats (telegram_id, first_seen) VALUES (?, ?)",
+            (tg_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TrackChatsMiddleware(BaseMiddleware):
+    """Запоминает каждого, кто написал боту в личку (например /start), чтобы ему доходила рассылка."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            if event.chat.type == "private" and event.from_user:
+                register_chat(event.from_user.id)
+        except Exception as e:
+            logger.warning(f"Не удалось запомнить чат: {e}")
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(TrackChatsMiddleware())
 
 
 def is_admin(tg_id: int) -> bool:
@@ -938,9 +972,14 @@ async def cmd_sms(message: Message):
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT telegram_id FROM users WHERE telegram_id IS NOT NULL")
-    tg_ids = [row[0] for row in cursor.fetchall()]
+    cursor.execute(
+        "SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL "
+        "UNION SELECT telegram_id FROM bot_chats"
+    )
+    tg_ids = {row[0] for row in cursor.fetchall()}
     conn.close()
+    tg_ids.add(message.from_user.id)  # чтобы админ тоже увидел сообщение в чате с ботом
+    tg_ids = list(tg_ids)
 
     await message.answer(f"📤 Отправляю {len(tg_ids)} пользователям, скоро напишу итог.")
     # Запускаем в фоне, чтобы бот не «зависал» на время рассылки
