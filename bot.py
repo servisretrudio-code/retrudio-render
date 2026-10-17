@@ -151,18 +151,30 @@ def reset_attempts(tg_id: int):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     docs_path = os.path.join(SCHEMS_DIR, "docs.html")
+    rules_path = os.path.join(SCHEMS_DIR, "rules.html")
     caption_text = (
         "📜 <b>Ознакомьтесь с правилами сервиса.</b>\n\n"
         "Если вы согласны с условиями использования, "
         "войдите в аккаунт командой: /login\n\n"
         "📋 Список команд: /help"
     )
-    if os.path.exists(docs_path):
-        document = FSInputFile(docs_path)
-        await message.answer_document(document=document, caption=caption_text)
-    else:
-        await message.answer("⚠️ Файл с правилами не найден.\n\n" + caption_text)
+    
+    has_docs = os.path.exists(docs_path)
+    has_rules = os.path.exists(rules_path)
 
+    if has_docs and has_rules:
+        # Если есть оба файла: первый отправляем без подписи, второй с подписью
+        await message.answer_document(document=FSInputFile(docs_path))
+        await message.answer_document(document=FSInputFile(rules_path), caption=caption_text)
+    elif has_rules:
+        # Если есть только rules.html
+        await message.answer_document(document=FSInputFile(rules_path), caption=caption_text)
+    elif has_docs:
+        # Если есть только docs.html (теперь подпись не потеряется!)
+        await message.answer_document(document=FSInputFile(docs_path), caption=caption_text)
+    else:
+        # Если вообще ничего нет
+        await message.answer("⚠️ Файлы с правилами не найдены.\n\n" + caption_text)
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
