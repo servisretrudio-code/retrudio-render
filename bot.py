@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import os
+import re
 import logging
 import random
 import string
@@ -9,11 +10,11 @@ import json
 import hashlib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -51,8 +52,8 @@ DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_DIR, "app.db")
 
 # Защита от брутфорса: {telegram_id: {"attempts": int, "blocked_until": datetime}}
 _login_attempts: dict = {}
-MAX_ATTEMPTS = 5          
-BLOCK_DURATION_MIN = 15   
+MAX_ATTEMPTS = 5
+BLOCK_DURATION_MIN = 15
 # -----------------
 
 if not BOT_TOKEN:
@@ -65,6 +66,11 @@ dp = Dispatcher()
 def esc(value) -> str:
     """Экранирование пользовательских данных для HTML parse_mode."""
     return html.escape(str(value))
+
+
+def db_connect():
+    """Подключение к БД с ожиданием блокировки (сайт может писать в ту же БД)."""
+    return sqlite3.connect(DB_PATH, timeout=10)
 
 
 class AuthStates(StatesGroup):
@@ -81,11 +87,11 @@ class ChangePasswordStates(StatesGroup):
 # --- Инициализация базы данных и новых колонок статусов ---
 def init_db_columns():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(users)")
         columns = [col[1] for col in cursor.fetchall()]
-        
+
         if "telegram_id" not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN telegram_id INTEGER")
         if "status" not in columns:
@@ -97,11 +103,10 @@ def init_db_columns():
         if "is_admin" not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
 
-        # Все, кто хоть раз писал боту (в том числе без регистрации на сайте) — для рассылки
+        # Все, кто хоть раз написал боту (для рассылки /sms)
         cursor.execute(
-            "CREATE TABLE IF NOT EXISTS bot_chats ("
-            "telegram_id INTEGER PRIMARY KEY, "
-            "first_seen TEXT)"
+            "CREATE TABLE IF NOT EXISTS bot_users ("
+            "telegram_id INTEGER PRIMARY KEY, first_seen TEXT)"
         )
 
         conn.commit()
@@ -110,38 +115,11 @@ def init_db_columns():
         logger.error(f"Ошибка инициализации колонок БД: {e}")
 
 
-def register_chat(tg_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO bot_chats (telegram_id, first_seen) VALUES (?, ?)",
-            (tg_id, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-class TrackChatsMiddleware(BaseMiddleware):
-    """Запоминает каждого, кто написал боту в личку (например /start), чтобы ему доходила рассылка."""
-
-    async def __call__(self, handler, event, data):
-        try:
-            if event.chat.type == "private" and event.from_user:
-                register_chat(event.from_user.id)
-        except Exception as e:
-            logger.warning(f"Не удалось запомнить чат: {e}")
-        return await handler(event, data)
-
-
-dp.message.outer_middleware(TrackChatsMiddleware())
-
-
 def is_admin(tg_id: int) -> bool:
     if tg_id in ADMIN_IDS:
         return True
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("SELECT is_admin FROM users WHERE telegram_id = ?", (tg_id,))
         row = cursor.fetchone()
@@ -156,7 +134,7 @@ def is_blocked_brute(tg_id: int) -> tuple[bool, int]:
     if not info:
         return False, 0
     if info.get("blocked_until") and datetime.utcnow() < info["blocked_until"]:
-        remaining = (info["blocked_until"] - datetime.utcnow()).seconds // 60 + 1
+        remaining = int((info["blocked_until"] - datetime.utcnow()).total_seconds() // 60) + 1
         return True, remaining
     return False, 0
 
@@ -181,6 +159,135 @@ def reset_attempts(tg_id: int):
         del _login_attempts[tg_id]
 
 
+# --- Учёт всех пользователей бота, поиск пользователей, проверка банов ---
+
+_known_users: set = set()
+
+
+def register_bot_user(tg_id: int):
+    """Запоминаем каждого, кто хоть раз написал боту (для рассылки)."""
+    if tg_id in _known_users:
+        return
+    try:
+        conn = db_connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_users (telegram_id, first_seen) VALUES (?, ?)",
+            (tg_id, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        conn.close()
+        _known_users.add(tg_id)
+    except Exception as e:
+        logger.error(f"Не удалось записать bot_user {tg_id}: {e}")
+
+
+def get_ban_text(tg_id: int, user_id_db=None):
+    """Текст бана, если аккаунт (привязанный к Telegram или из текущей сессии) забанен."""
+    try:
+        conn = db_connect()
+        rows = conn.execute(
+            "SELECT id, status, banned_until, ban_reason FROM users "
+            "WHERE telegram_id=? OR id=?",
+            (tg_id, user_id_db if user_id_db is not None else -1),
+        ).fetchall()
+        result = None
+        for uid, status, until, reason in rows:
+            if status == "perm_banned":
+                result = f"🚫 <b>Ваш аккаунт заблокирован навсегда.</b>\nПричина: {esc(reason or 'Нарушение правил')}"
+                break
+            if status == "banned":
+                try:
+                    still_banned = bool(until) and datetime.fromisoformat(until) > datetime.utcnow()
+                except ValueError:
+                    still_banned = True  # странный формат даты — считаем бан действующим
+                if still_banned:
+                    result = (f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок: до {str(until)[:16]}\n"
+                              f"Причина: {esc(reason or 'Нарушение правил')}")
+                    break
+                # срок истёк — снимаем бан
+                conn.execute(
+                    "UPDATE users SET status='active', banned_until=NULL, ban_reason=NULL WHERE id=?",
+                    (uid,),
+                )
+                conn.commit()
+        conn.close()
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка проверки бана: {e}")
+        return None
+
+
+COMMAND_RE = re.compile(r"^/([A-Za-z_]+)(?:@\w+)?(?:\s|$)")
+KNOWN_COMMANDS = {
+    "start", "help", "login", "buy", "status", "change_password", "stop_subscription",
+    "support", "admin", "permban", "ban", "unban", "givepro", "cancelpro",
+    "resetpassword", "sms", "smsadmin", "setadmin", "rename", "pending",
+}
+
+
+class TrackAndBanMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user:
+            register_bot_user(user.id)
+            state = data.get("state")
+
+            # Команда прерывает незавершённый диалог (иначе обработчик ввода пароля
+            # «съест» команду, например /ban, и она не сработает)
+            if isinstance(event, Message) and event.text and state is not None:
+                m = COMMAND_RE.match(event.text)
+                if m and m.group(1).lower() in KNOWN_COMMANDS:
+                    if await state.get_state() is not None:
+                        await state.set_state(None)  # данные сессии (user_id_db) сохраняются
+                        data["raw_state"] = None
+
+            is_payment = isinstance(event, Message) and event.successful_payment
+            if not is_payment and not is_admin(user.id):
+                user_id_db = None
+                if state is not None:
+                    user_id_db = (await state.get_data()).get("user_id_db")
+                ban_text = get_ban_text(user.id, user_id_db)
+                if ban_text:
+                    if isinstance(event, Message):
+                        await event.answer(ban_text)
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer("🚫 Аккаунт заблокирован.", show_alert=True)
+                    return
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(TrackAndBanMiddleware())
+dp.callback_query.outer_middleware(TrackAndBanMiddleware())
+
+
+def find_user(cursor, ident: str):
+    """Поиск по email ИЛИ нику, без учёта регистра. Возвращает (id, telegram_id, subscription_until)."""
+    ident = ident.strip()
+    cursor.execute(
+        "SELECT id, telegram_id, subscription_until FROM users "
+        "WHERE LOWER(email)=LOWER(?) OR LOWER(username)=LOWER(?) "
+        "ORDER BY (LOWER(email)=LOWER(?)) DESC LIMIT 1",
+        (ident, ident, ident),
+    )
+    return cursor.fetchone()
+
+
+def get_all_broadcast_ids() -> list:
+    """Все, кому бот может написать: вошедшие в аккаунт + все, кто хоть раз писал боту + админы."""
+    ids = set(ADMIN_IDS)
+    try:
+        conn = db_connect()
+        for q in (
+            "SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL",
+            "SELECT telegram_id FROM bot_users",
+        ):
+            ids |= {r[0] for r in conn.execute(q).fetchall()}
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка получения списка рассылки: {e}")
+    return list(ids)
+
+
 # --- Пользовательские команды ---
 
 @dp.message(Command("start"))
@@ -193,23 +300,20 @@ async def cmd_start(message: Message):
         "войдите в аккаунт командой: /login\n\n"
         "📋 Список команд: /help"
     )
-    
+
     has_docs = os.path.exists(docs_path)
     has_rules = os.path.exists(rules_path)
 
     if has_docs and has_rules:
-        # Если есть оба файла: первый отправляем без подписи, второй с подписью
         await message.answer_document(document=FSInputFile(docs_path))
         await message.answer_document(document=FSInputFile(rules_path), caption=caption_text)
     elif has_rules:
-        # Если есть только rules.html
         await message.answer_document(document=FSInputFile(rules_path), caption=caption_text)
     elif has_docs:
-        # Если есть только docs.html (теперь подпись не потеряется!)
         await message.answer_document(document=FSInputFile(docs_path), caption=caption_text)
     else:
-        # Если вообще ничего нет
         await message.answer("⚠️ Файлы с правилами не найдены.\n\n" + caption_text)
+
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -236,7 +340,7 @@ async def cmd_status(message: Message, state: FSMContext):
         return
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("SELECT username, email, subscription_until FROM users WHERE id=?", (user_id_db,))
         user = cursor.fetchone()
@@ -268,7 +372,6 @@ async def cmd_status(message: Message, state: FSMContext):
         )
     except Exception as e:
         logger.error(f"Ошибка /status: {e}")
-        logger.error(f"Ошибка: {e}")
         await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
 
 
@@ -300,10 +403,6 @@ async def process_login(message: Message, state: FSMContext):
 async def process_password(message: Message, state: FSMContext):
     tg_id = message.from_user.id
 
-    if message.text.startswith("/"):
-        await message.answer("⚠️ Завершите авторизацию — введите пароль.")
-        return
-
     try:
         await message.delete()
     except Exception:
@@ -311,7 +410,7 @@ async def process_password(message: Message, state: FSMContext):
 
     blocked, mins = is_blocked_brute(tg_id)
     if blocked:
-        await state.clear()
+        await state.set_state(None)
         await message.answer(f"🚫 <b>Слишком много неудачных попыток.</b>\nПовторите через {mins} мин.")
         return
 
@@ -320,29 +419,34 @@ async def process_password(message: Message, state: FSMContext):
     login = data.get("login")
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, username, password_hash, status, banned_until, ban_reason FROM users WHERE email = ? OR username = ?",
-            (login, login),
+            "SELECT id, username, password_hash, status, banned_until, ban_reason FROM users "
+            "WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?) "
+            "ORDER BY (LOWER(email) = LOWER(?)) DESC LIMIT 1",
+            (login, login, login),
         )
         user = cursor.fetchone()
 
         if user:
             user_id_db, username_db, password_hash, status, banned_until, ban_reason = user
-            
+
             # Проверка статуса BANNED / PERM_BANNED
             if status == 'perm_banned':
                 conn.close()
-                await state.clear()
+                await state.set_state(None)
                 await message.answer(f"🚫 <b>Ваш аккаунт заблокирован навсегда.</b>\nПричина: {esc(ban_reason or 'Нарушение правил')}")
                 return
-            elif status == 'banned' and banned_until:
-                banned_dt = datetime.fromisoformat(banned_until)
-                if banned_dt > datetime.utcnow():
+            elif status == 'banned':
+                try:
+                    still_banned = bool(banned_until) and datetime.fromisoformat(banned_until) > datetime.utcnow()
+                except ValueError:
+                    still_banned = True
+                if still_banned:
                     conn.close()
-                    await state.clear()
-                    await message.answer(f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок: до {banned_until[:16]}\nПричина: {esc(ban_reason or 'Нарушение правил')}")
+                    await state.set_state(None)
+                    await message.answer(f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок: до {str(banned_until)[:16]}\nПричина: {esc(ban_reason or 'Нарушение правил')}")
                     return
                 else:
                     cursor.execute("UPDATE users SET status='active', banned_until=NULL, ban_reason=NULL WHERE id=?", (user_id_db,))
@@ -355,7 +459,7 @@ async def process_password(message: Message, state: FSMContext):
                 cursor.execute("UPDATE users SET telegram_id=? WHERE id=?", (tg_id, user_id_db))
                 conn.commit()
                 conn.close()
-                
+
                 await state.clear()
                 await state.update_data(user_id_db=user_id_db)
                 await message.answer(
@@ -368,23 +472,21 @@ async def process_password(message: Message, state: FSMContext):
             else:
                 conn.close()
                 remaining = record_failed_attempt(tg_id)
+                await state.set_state(None)
                 if remaining == 0:
-                    await state.clear()
-                    await message.answer(f"🚫 <b>Превышен лимит попыток.</b>\nАккаунт заблокирован на {BLOCK_DURATION_MIN} мин.")
+                    await message.answer(f"🚫 <b>Превышен лимит попыток.</b>\nВход заблокирован на {BLOCK_DURATION_MIN} мин.")
                 else:
                     await message.answer(f"❌ Неверный пароль. Осталось попыток: {remaining}\nПопробуйте снова: /login")
-                    await state.clear()
         else:
             conn.close()
             record_failed_attempt(tg_id)
+            await state.set_state(None)
             await message.answer("❌ Пользователь не найден. Попробуйте снова: /login")
-            await state.clear()
 
     except Exception as e:
         logger.error(f"Ошибка авторизации: {e}")
-        logger.error(f"Ошибка: {e}")
         await message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
-        await state.clear()
+        await state.set_state(None)
 
 
 # --- Оплата и прочие команды ---
@@ -425,7 +527,7 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 def get_admin_ids() -> set:
     ids = set(ADMIN_IDS)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("SELECT telegram_id FROM users WHERE is_admin=1 AND telegram_id IS NOT NULL")
         ids |= {row[0] for row in cursor.fetchall()}
@@ -437,7 +539,7 @@ def get_admin_ids() -> set:
 
 def get_user_email(user_id_db) -> str:
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         row = conn.execute("SELECT email FROM users WHERE id=?", (user_id_db,)).fetchone()
         conn.close()
         return (row[0] if row and row[0] else "unknown")
@@ -579,7 +681,7 @@ async def process_successful_payment(message: Message):
 
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         days = 30
         now_str = datetime.utcnow().isoformat(timespec="seconds")
@@ -656,7 +758,7 @@ async def process_old_password(message: Message, state: FSMContext):
     data = await state.get_data()
     user_id_db = data.get("user_id_db")
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("SELECT password_hash FROM users WHERE id=?", (user_id_db,))
         row = cursor.fetchone()
@@ -700,7 +802,7 @@ async def process_confirm_password(message: Message, state: FSMContext):
         return
     try:
         new_hash = generate_password_hash(message.text)
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, data.get("user_id_db")))
         conn.commit()
@@ -721,7 +823,7 @@ async def cmd_stop_subscription(message: Message, state: FSMContext):
         await message.answer("⚠️ Сначала войдите в аккаунт: /login")
         return
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cursor = conn.cursor()
         now_str = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
         cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, user_id_db))
@@ -744,15 +846,17 @@ async def cmd_admin_panel(message: Message):
         return
     await message.answer(
         "🛠 <b>Панель технической поддержки (Admin):</b>\n\n"
-        "• <code>/permban [email] [причина]</code> — вечный бан\n"
-        "• <code>/ban [email] [срок_в_днях] [причина]</code> — временный бан\n"
-        "• <code>/givepro [email] [срок_в_днях] [за_что]</code> — выдать PRO тариф\n"
-        "• <code>/cancelpro [email] [причина]</code> — отменить PRO тариф\n"
-        "• <code>/resetpassword [email]</code> — сбросить пароль\n"
-        "• <code>/sms [текст]</code> — рассылка всем юзерам\n"
+        "Везде, где [email/ник] — можно указать email или ник.\n\n"
+        "• <code>/permban [email/ник] [причина]</code> — вечный бан\n"
+        "• <code>/ban [email/ник] [срок_в_днях] [причина]</code> — временный бан\n"
+        "• <code>/unban [email/ник]</code> — снять бан\n"
+        "• <code>/givepro [email/ник] [срок_в_днях] [за_что]</code> — выдать PRO тариф\n"
+        "• <code>/cancelpro [email/ник] [причина]</code> — отменить PRO тариф\n"
+        "• <code>/resetpassword [email/ник]</code> — сбросить пароль\n"
+        "• <code>/sms [текст]</code> — рассылка ВСЕМ, кто когда-либо писал боту\n"
         "• <code>/smsadmin [текст]</code> — рассылка админам\n"
-        "• <code>/setadmin [email]</code> — сделать админом\n"
-        "• <code>/rename [email] [новый_ник]</code> — поменять ник\n"
+        "• <code>/setadmin [email/ник]</code> — сделать админом\n"
+        "• <code>/rename [email/ник] [новый_ник]</code> — поменять ник\n"
         "• <code>/pending</code> — необработанные платежи (prouser.json)"
     )
 
@@ -762,28 +866,34 @@ async def cmd_permban(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: <code>/permban [email] [причина]</code>")
+        await message.answer("⚠️ Использование: <code>/permban [email/ник] [причина]</code>")
         return
-    email, reason = args[1], args[2]
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, telegram_id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    ident, reason = args[1], args[2]
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        cursor.execute(
+            "UPDATE users SET status='perm_banned', banned_until=NULL, ban_reason=? WHERE id=?",
+            (reason, uid),
+        )
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"permban: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    uid, tg_id = u[0], u[1]
-    cursor.execute("UPDATE users SET status='perm_banned', ban_reason=? WHERE id=?", (reason, uid))
-    conn.commit()
-    conn.close()
 
     if tg_id:
         try:
             await bot.send_message(tg_id, f"🚫 <b>Ваш аккаунт заблокирован навсегда.</b>\nПричина: {esc(reason)}")
         except Exception: pass
-    await message.answer(f"✅ Пользователь {esc(email)} заблокирован навсегда.")
+    await message.answer(f"✅ Пользователь {esc(ident)} заблокирован навсегда.")
 
 
 @dp.message(Command("ban"))
@@ -791,34 +901,78 @@ async def cmd_ban(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=3)
     if len(args) < 4:
-        await message.answer("⚠️ Использование: <code>/ban [email] [срок_в_днях] [причина]</code>")
+        await message.answer("⚠️ Использование: <code>/ban [email/ник] [срок_в_днях] [причина]</code>")
         return
-    email, days_str, reason = args[1], args[2], args[3]
+    ident, days_str, reason = args[1], args[2], args[3]
     try:
         days = int(days_str)
+        if days <= 0:
+            raise ValueError
     except ValueError:
-        await message.answer("❌ Срок должен быть числом дней.")
+        await message.answer("❌ Срок должен быть положительным числом дней.")
         return
 
-    banned_until = (datetime.utcnow() + timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, telegram_id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    banned_until = (datetime.utcnow() + timedelta(days=days)).isoformat(timespec="seconds")
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        cursor.execute(
+            "UPDATE users SET status='banned', banned_until=?, ban_reason=? WHERE id=?",
+            (banned_until, reason, uid),
+        )
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"ban: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    uid, tg_id = u[0], u[1]
-    cursor.execute("UPDATE users SET status='banned', banned_until=?, ban_reason=? WHERE id=?", (banned_until, reason, uid))
-    conn.commit()
-    conn.close()
 
     if tg_id:
         try:
             await bot.send_message(tg_id, f"🚫 <b>Ваш аккаунт заблокирован.</b>\nСрок до: {banned_until[:16]}\nПричина: {esc(reason)}")
         except Exception: pass
-    await message.answer(f"✅ Пользователь {esc(email)} заблокирован на {days} дней.")
+    await message.answer(f"✅ Пользователь {esc(ident)} заблокирован на {days} дн.")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if not is_admin(message.from_user.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Использование: <code>/unban [email/ник]</code>")
+        return
+    ident = args[1].strip()
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        cursor.execute(
+            "UPDATE users SET status='active', banned_until=NULL, ban_reason=NULL WHERE id=?",
+            (uid,),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"unban: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
+        return
+
+    if tg_id:
+        try:
+            await bot.send_message(tg_id, "✅ <b>Ваш аккаунт разблокирован.</b>")
+        except Exception: pass
+    await message.answer(f"✅ Пользователь {esc(ident)} разблокирован.")
 
 
 @dp.message(Command("givepro"))
@@ -826,40 +980,44 @@ async def cmd_givepro(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=3)
     if len(args) < 4:
-        await message.answer("⚠️ Использование: <code>/givepro [email] [срок_в_днях] [за_что]</code>")
+        await message.answer("⚠️ Использование: <code>/givepro [email/ник] [срок_в_днях] [за_что]</code>")
         return
-    email, days_str, reason = args[1], args[2], args[3]
+    ident, days_str, reason = args[1], args[2], args[3]
     try:
         days = int(days_str)
     except ValueError:
         await message.answer("❌ Срок должен быть числом дней.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, subscription_until, telegram_id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id, sub_until_str = u
+        base = (
+            datetime.fromisoformat(sub_until_str)
+            if sub_until_str and datetime.fromisoformat(sub_until_str) > datetime.utcnow()
+            else datetime.utcnow()
+        )
+        new_sub_until = (base + timedelta(days=days)).isoformat()
+        cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (new_sub_until, uid))
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"givepro: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    uid, sub_until_str, tg_id = u[0], u[1], u[2]
-    base = (
-        datetime.fromisoformat(sub_until_str)
-        if sub_until_str and datetime.fromisoformat(sub_until_str) > datetime.utcnow()
-        else datetime.utcnow()
-    )
-    new_sub_until = (base + timedelta(days=days)).isoformat()
-    cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (new_sub_until, uid))
-    conn.commit()
-    conn.close()
 
     sub_date_formatted = new_sub_until[:10]
     if tg_id:
         try:
             await bot.send_message(tg_id, f"🎉 <b>Вам выдали тариф!</b>\nСрок истечения: {sub_date_formatted}\nПричина: {esc(reason)}")
         except Exception: pass
-    await message.answer(f"✅ Пользователю {esc(email)} выдан PRO тариф до {sub_date_formatted}.")
+    await message.answer(f"✅ Пользователю {esc(ident)} выдан PRO тариф до {sub_date_formatted}.")
 
 
 @dp.message(Command("cancelpro"))
@@ -867,29 +1025,33 @@ async def cmd_cancelpro(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: <code>/cancelpro [email] [причина]</code>")
+        await message.answer("⚠️ Использование: <code>/cancelpro [email/ник] [причина]</code>")
         return
-    email, reason = args[1], args[2]
+    ident, reason = args[1], args[2]
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, telegram_id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        now_str = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
+        cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, uid))
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"cancelpro: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    uid, tg_id = u[0], u[1]
-    now_str = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
-    cursor.execute("UPDATE users SET subscription_until=? WHERE id=?", (now_str, uid))
-    conn.commit()
-    conn.close()
 
     if tg_id:
         try:
             await bot.send_message(tg_id, f"🛑 <b>Ваш PRO тариф был отменен.</b>\nПричина: {esc(reason)}")
         except Exception: pass
-    await message.answer(f"✅ PRO тариф пользователя {esc(email)} отменен.")
+    await message.answer(f"✅ PRO тариф пользователя {esc(ident)} отменен.")
 
 
 @dp.message(Command("resetpassword"))
@@ -897,32 +1059,38 @@ async def cmd_resetpassword(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: <code>/resetpassword [email]</code>")
+        await message.answer("⚠️ Использование: <code>/resetpassword [email/ник]</code>")
         return
-    email = args[1]
+    ident = args[1].strip()
 
-    new_pass = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    new_pass = ''.join(random.SystemRandom().choices(string.ascii_letters + string.digits, k=10))
     new_hash = generate_password_hash(new_pass)
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, telegram_id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        cursor.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, uid))
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"resetpassword: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    uid, tg_id = u[0], u[1]
-    cursor.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, uid))
-    conn.commit()
-    conn.close()
 
     if tg_id:
         try:
             await bot.send_message(tg_id, f"🔑 <b>Ваш пароль был сброшен.</b>\nНовый временный пароль: <code>{new_pass}</code>")
         except Exception: pass
-    await message.answer(f"✅ Пароль для {esc(email)} сброшен.\nНовый пароль: <code>{new_pass}</code>")
+    await message.answer(f"✅ Пароль для {esc(ident)} сброшен.\nНовый пароль: <code>{new_pass}</code>")
 
+
+# --- Рассылка ---
 
 async def _send_one(tg_id: int, text: str, sem: asyncio.Semaphore) -> str:
     """Отправка одного сообщения. Возвращает 'ok' / 'blocked' / 'failed'."""
@@ -970,16 +1138,7 @@ async def cmd_sms(message: Message):
         return
     text = f"📢 {parts[1]}"
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL "
-        "UNION SELECT telegram_id FROM bot_chats"
-    )
-    tg_ids = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    tg_ids.add(message.from_user.id)  # чтобы админ тоже увидел сообщение в чате с ботом
-    tg_ids = list(tg_ids)
+    tg_ids = get_all_broadcast_ids()
 
     await message.answer(f"📤 Отправляю {len(tg_ids)} пользователям, скоро напишу итог.")
     # Запускаем в фоне, чтобы бот не «зависал» на время рассылки
@@ -997,14 +1156,8 @@ async def cmd_smsadmin(message: Message):
         return
     text = args[1]
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id FROM users WHERE is_admin=1 AND telegram_id IS NOT NULL")
-    admin_ids = {row[0] for row in cursor.fetchall()} | set(ADMIN_IDS)
-    conn.close()
-
     success = 0
-    for tg_id in admin_ids:
+    for tg_id in get_admin_ids():
         try:
             await bot.send_message(tg_id, f"🛡 <b>Для админов:</b>\n\n{esc(text)}")
             success += 1
@@ -1018,22 +1171,26 @@ async def cmd_setadmin(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: <code>/setadmin [email]</code>")
+        await message.answer("⚠️ Использование: <code>/setadmin [email/ник]</code>")
         return
-    email = args[1]
+    ident = args[1].strip()
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        cursor.execute("UPDATE users SET is_admin=1 WHERE id=?", (u[0],))
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"setadmin: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    cursor.execute("UPDATE users SET is_admin=1 WHERE id=?", (u[0],))
-    conn.commit()
-    conn.close()
-    await message.answer(f"✅ Пользователь {esc(email)} теперь администратор.")
+    await message.answer(f"✅ Пользователь {esc(ident)} теперь администратор.")
 
 
 @dp.message(Command("rename"))
@@ -1041,22 +1198,26 @@ async def cmd_rename(message: Message):
     if not is_admin(message.from_user.id): return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer("⚠️ Использование: <code>/rename [email] [новый_ник]</code>")
+        await message.answer("⚠️ Использование: <code>/rename [email/ник] [новый_ник]</code>")
         return
-    email, new_name = args[1], args[2]
+    ident, new_name = args[1], args[2]
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email=?", (email,))
-    u = cursor.fetchone()
-    if not u:
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        cursor.execute("UPDATE users SET username=? WHERE id=?", (new_name, u[0]))
+        conn.commit()
         conn.close()
-        await message.answer("❌ Пользователь с таким email не найден.")
+    except Exception as e:
+        logger.error(f"rename: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    cursor.execute("UPDATE users SET username=? WHERE id=?", (new_name, u[0]))
-    conn.commit()
-    conn.close()
-    await message.answer(f"✅ Ник пользователя {esc(email)} изменен на <code>{esc(new_name)}</code>.")
+    await message.answer(f"✅ Ник пользователя {esc(ident)} изменен на <code>{esc(new_name)}</code>.")
 
 
 # --- Запуск ---
