@@ -1183,14 +1183,31 @@ async def cmd_setadmin(message: Message):
             conn.close()
             await message.answer("❌ Пользователь не найден.")
             return
-        cursor.execute("UPDATE users SET is_admin=1 WHERE id=?", (u[0],))
+        uid, tg_id = u[0], u[1]
+        cursor.execute("UPDATE users SET is_admin=1 WHERE id=?", (uid,))
+        changed = cursor.rowcount
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"setadmin: {e}")
         await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
         return
-    await message.answer(f"✅ Пользователь {esc(ident)} теперь администратор.")
+
+    if changed != 1:
+        await message.answer("⚠️ Не удалось выдать права: запись не обновилась.")
+        return
+
+    text = f"✅ Пользователь {esc(ident)} теперь администратор. На сайте права действуют сразу."
+    if tg_id:
+        try:
+            await bot.send_message(tg_id, "🛡 <b>Вам выданы права администратора.</b>\nСписок команд: /admin")
+        except Exception:
+            pass
+    else:
+        # В боте админом считается тот, чей Telegram привязан к аккаунту (через /login)
+        text += ("\n\n⚠️ Telegram у этого пользователя ещё не привязан. "
+                 "Админ-команды в боте заработают после того, как он войдёт командой /login.")
+    await message.answer(text)
 
 
 @dp.message(Command("rename"))
@@ -1200,7 +1217,10 @@ async def cmd_rename(message: Message):
     if len(args) < 3:
         await message.answer("⚠️ Использование: <code>/rename [email/ник] [новый_ник]</code>")
         return
-    ident, new_name = args[1], args[2]
+    ident, new_name = args[1], args[2].strip()
+    if not new_name or len(new_name) > 60:
+        await message.answer("❌ Ник должен быть от 1 до 60 символов.")
+        return
 
     try:
         conn = db_connect()
@@ -1210,12 +1230,38 @@ async def cmd_rename(message: Message):
             conn.close()
             await message.answer("❌ Пользователь не найден.")
             return
-        cursor.execute("UPDATE users SET username=? WHERE id=?", (new_name, u[0]))
+        uid = u[0]
+
+        # Сайт показывает имя из колонки name, а вход по нику идёт по username —
+        # меняем обе (те, что есть в таблице), чтобы ник изменился везде
+        cols = {c[1] for c in cursor.execute("PRAGMA table_info(users)").fetchall()}
+        targets = [c for c in ("username", "name") if c in cols]
+        if not targets:
+            conn.close()
+            await message.answer("⚠️ В таблице users нет колонок username/name.")
+            return
+
+        if "username" in cols:
+            taken = cursor.execute(
+                "SELECT 1 FROM users WHERE LOWER(username)=LOWER(?) AND id!=?", (new_name, uid)
+            ).fetchone()
+            if taken:
+                conn.close()
+                await message.answer("❌ Такой ник уже занят другим пользователем.")
+                return
+
+        set_clause = ", ".join(f"{c}=?" for c in targets)  # имена колонок — только из белого списка выше
+        cursor.execute(f"UPDATE users SET {set_clause} WHERE id=?", (*([new_name] * len(targets)), uid))
+        changed = cursor.rowcount
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"rename: {e}")
         await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
+        return
+
+    if changed != 1:
+        await message.answer("⚠️ Ник не изменился: запись не обновилась.")
         return
     await message.answer(f"✅ Ник пользователя {esc(ident)} изменен на <code>{esc(new_name)}</code>.")
 
