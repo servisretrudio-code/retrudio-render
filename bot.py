@@ -468,6 +468,8 @@ async def process_password(message: Message, state: FSMContext):
                     f"• Статус подписки: /status\n"
                     f"• Купить подписку: /buy\n"
                     f"• Сменить пароль: /change_password"
+                    f"• СТОП-подписка: /stop_subscription"
+                    f"• Нету нужной команды?: /support"
                 )
             else:
                 conn.close()
