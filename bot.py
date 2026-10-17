@@ -467,9 +467,9 @@ async def process_password(message: Message, state: FSMContext):
                     f"Привет, {esc(display_name)}!\n\n"
                     f"• Статус подписки: /status\n"
                     f"• Купить подписку: /buy\n"
-                    f"• Сменить пароль: /change_password"
-                    f"• СТОП-подписка: /stop_subscription"
-                    f"• Нету нужной команды?: /support"
+                    f"• Сменить пароль: /change_password\n"
+                    f"• СТОП-подписка: /stop_subscription\n"
+                    f"• Нету нужной команды?: /support\n"
                 )
             else:
                 conn.close()
