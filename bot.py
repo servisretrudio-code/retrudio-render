@@ -221,7 +221,7 @@ COMMAND_RE = re.compile(r"^/([A-Za-z_]+)(?:@\w+)?(?:\s|$)")
 KNOWN_COMMANDS = {
     "start", "help", "login", "buy", "status", "change_password", "stop_subscription",
     "support", "admin", "permban", "ban", "unban", "givepro", "cancelpro",
-    "resetpassword", "sms", "smsadmin", "setadmin", "rename", "pending",
+    "resetpassword", "sms", "smsadmin", "setadmin", "stopadm", "rename", "pending",
 }
 
 
@@ -856,6 +856,7 @@ async def cmd_admin_panel(message: Message):
         "• <code>/sms [текст]</code> — рассылка ВСЕМ, кто когда-либо писал боту\n"
         "• <code>/smsadmin [текст]</code> — рассылка админам\n"
         "• <code>/setadmin [email/ник]</code> — сделать админом\n"
+        "• <code>/stopadm [email/ник]</code> — снять админа\n"
         "• <code>/rename [email/ник] [новый_ник]</code> — поменять ник\n"
         "• <code>/pending</code> — необработанные платежи (prouser.json)"
     )
@@ -1207,6 +1208,50 @@ async def cmd_setadmin(message: Message):
         # В боте админом считается тот, чей Telegram привязан к аккаунту (через /login)
         text += ("\n\n⚠️ Telegram у этого пользователя ещё не привязан. "
                  "Админ-команды в боте заработают после того, как он войдёт командой /login.")
+    await message.answer(text)
+
+
+@dp.message(Command("stopadm"))
+async def cmd_stopadm(message: Message):
+    if not is_admin(message.from_user.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Использование: <code>/stopadm [email/ник]</code>")
+        return
+    ident = args[1].strip()
+
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        u = find_user(cursor, ident)
+        if not u:
+            conn.close()
+            await message.answer("❌ Пользователь не найден.")
+            return
+        uid, tg_id = u[0], u[1]
+        cursor.execute("UPDATE users SET is_admin=0 WHERE id=?", (uid,))
+        changed = cursor.rowcount
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"stopadm: {e}")
+        await message.answer(f"⚠️ Ошибка БД: <code>{esc(e)}</code>")
+        return
+
+    if changed != 1:
+        await message.answer("⚠️ Не удалось снять права: запись не обновилась.")
+        return
+
+    text = f"✅ У пользователя {esc(ident)} сняты права администратора (на сайте и в боте)."
+    if tg_id and tg_id in ADMIN_IDS:
+        # Эти ID прописаны прямо в коде, из базы их не снять
+        text += ("\n\n⚠️ Но Telegram ID этого пользователя прописан в списке ADMIN_IDS в коде бота, "
+                 "поэтому в боте он останется админом, пока вы не уберёте его ID из этого списка в bot.py.")
+    elif tg_id:
+        try:
+            await bot.send_message(tg_id, "🛡 <b>Ваши права администратора сняты.</b>")
+        except Exception:
+            pass
     await message.answer(text)
 
 
