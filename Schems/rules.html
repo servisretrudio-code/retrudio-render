@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Правила пользования — Retrudio</title>
+  <!-- Google Fonts & FontAwesome Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <style>
+    :root {
+      --bg-color: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --accent-danger: #f43f5e;
+      --accent-warning: #f59e0b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --radius: 12px;
+      --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      line-height: 1.6;
+      padding: 40px 20px;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    .header .logo-tag {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--primary);
+      font-size: 0.9rem;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .header h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+
+    .header p {
+      color: var(--text-muted);
+      font-size: 1.1rem;
+    }
+
+    .rules-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .rule-card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 28px;
+      box-shadow: var(--shadow);
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+
+    .rule-card:hover {
+      border-color: var(--primary);
+    }
+
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 1.35rem;
+      font-weight: 600;
+      color: var(--primary);
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 12px;
+    }
+
+    .card-title i {
+      font-size: 1.2rem;
+      background: rgba(56, 189, 248, 0.1);
+      padding: 10px;
+      border-radius: 8px;
+    }
+
+    .rule-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .rule-item {
+      position: relative;
+      padding-left: 28px;
+      color: var(--text-main);
+    }
+
+    .rule-item::before {
+      content: "•";
+      position: absolute;
+      left: 8px;
+      top: -2px;
+      color: var(--primary);
+      font-size: 1.5rem;
+    }
+
+    .rule-item strong {
+      color: #ffffff;
+    }
+
+    /* Специальные списки и плашки */
+    .forbidden-list {
+      background: rgba(244, 63, 94, 0.05);
+      border: 1px solid rgba(244, 63, 94, 0.2);
+      border-radius: 8px;
+      padding: 20px;
+      margin-top: 12px;
+    }
+
+    .forbidden-list .rule-item::before {
+      content: "✕";
+      color: var(--accent-danger);
+      font-size: 0.9rem;
+      top: 2px;
+      left: 6px;
+    }
+
+    .alert-box {
+      background: rgba(245, 158, 11, 0.1);
+      border-left: 4px solid var(--accent-warning);
+      padding: 14px 18px;
+      border-radius: 4px;
+      margin-top: 14px;
+      font-size: 0.95rem;
+      color: #fef08a;
+    }
+
+    .contact-card {
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      text-align: center;
+      border: 1px solid var(--primary);
+    }
+
+    .contact-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--primary);
+      text-decoration: none;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-top: 10px;
+      padding: 8px 16px;
+      background: rgba(56, 189, 248, 0.1);
+      border-radius: 6px;
+      transition: all 0.2s ease;
+    }
+
+    .contact-link:hover {
+      background: var(--primary);
+      color: #000;
+    }
+
+    @media (max-width: 600px) {
+      body {
+        padding: 20px 12px;
+      }
+      .header h1 {
+        font-size: 1.8rem;
+      }
+      .rule-card {
+        padding: 20px;
+      }
+      .card-title {
+        font-size: 1.15rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <header class="header">
+      <div class="logo-tag">&lt;RETRUDIO /&gt;</div>
+      <h1>Правила сервиса</h1>
+      <p>Пожалуйста, ознакомьтесь с условиями перед использованием платформы</p>
+    </header>
+
+    <main class="rules-grid">
+
+      <!-- Раздел 1 -->
+      <section class="rule-card">
+        <h2 class="card-title">
+          <i class="fa-solid fa-user-shield"></i>
+          1. Регистрация и Безопасность Аккаунта
+        </h2>
+        <ul class="rule-list">
+          <li class="rule-item">
+            <strong>Создание профиля:</strong> Доступ к конструктору схем, тарифам и публикации проектов предоставляется после авторизации.
+          </li>
+          <li class="rule-item">
+            <strong>Запрет на передачу аккаунта:</strong> Ваш аккаунт является персональным. Категорически запрещено передавать, продавать или предоставлять доступ к своему аккаунту (включая оплаченные тарифы) третьим лицам.
+          </li>
+          <li class="rule-item">
+            <strong>Ответственность:</strong> Вы несете полную личную ответственность за любые действия, совершенные через ваш профиль.
+          </li>
+        </ul>
+      </section>
+
+      <!-- Раздел 2 -->
+      <section class="rule-card">
+        <h2 class="card-title">
+          <i class="fa-solid fa-microchip"></i>
+          2. Правила Конструктора и Публикации Проектов
+        </h2>
+        <p style="margin-bottom: 12px; color: var(--text-muted);">
+          Конструктор схем и библиотека кодов созданы исключительно для образовательных, инженерных и творческих целей в сфере электроники и программирования Arduino.
+        </p>
+        
+        <p style="font-weight: 600; margin-top: 10px; color: var(--accent-danger);">
+          Категорически запрещено:
+        </p>
+        
+        <ul class="rule-list forbidden-list">
+          <li class="rule-item">
+            <strong>Непристойный контент:</strong> Выкладывать элементы, провода, платы или изображения, формирующие неприличные, оскорбительные, нецензурные или порнографические визуальные образы/надписи.
+          </li>
+          <li class="rule-item">
+            <strong>Вредоносный код:</strong> Публиковать скетчи (коды), содержащие вирусы, трояны или команды, предназначенные для нанесения физического вреда компонентам или взлома чужих устройств.
+          </li>
+          <li class="rule-item">
+            <strong>Нарушение авторских прав:</strong> Публиковать чужие платные проекты, схемы или библиотеки без явного согласия их авторов.
+          </li>
+          <li class="rule-item">
+            <strong>Спам и реклама:</strong> Использовать названия проектов и описания для рекламы сторонних товаров и услуг, не связанных с тематикой Arduino.
+          </li>
+        </ul>
+      </section>
+
+      <!-- Раздел 3 -->
+      <section class="rule-card">
+        <h2 class="card-title">
+          <i class="fa-solid fa-gem"></i>
+          3. Платные Услуги и Тарифы
+        </h2>
+        <ul class="rule-list">
+          <li class="rule-item">
+            <strong>Доступ к материалам:</strong> Платный тариф открывает доступ к исходному коду и подробному описанию закрытых проектов.
+          </li>
+          <li class="rule-item">
+            <strong>Защита данных:</strong> Попытки массового копирования (парсинга) платного контента с целью его перепродажи или бесплатного распространения приведут к немедленной блокировке без возврата средств.
+          </li>
+        </ul>
+      </section>
+
+      <!-- Раздел 4 -->
+      <section class="rule-card">
+        <h2 class="card-title">
+          <i class="fa-solid fa-gavel"></i>
+          4. Модерация и Нарушения
+        </h2>
+        <p style="margin-bottom: 12px;">Администрация Retrudio оставляет за собой право в одностороннем порядке:</p>
+        <ul class="rule-list">
+          <li class="rule-item">
+            Удалять схемы, проекты или комментарии, которые нарушают общепринятые этические нормы или данные Правила.
+          </li>
+          <li class="rule-item">
+            Временно ограничивать доступ или навсегда блокировать аккаунты пользователей за передачу учетных записей или создание неприличного контента в конструкторе.
+          </li>
+        </ul>
+
+        <div class="alert-box">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <strong>Обратите внимание:</strong> Использование никнеймов с подтекстом 18+ или содержащих оскорбительные слова строго запрещено. За данное нарушение следует бессрочная блокировка (пермбан).
+        </div>
+      </section>
+
+      <!-- Раздел 5 -->
+      <section class="rule-card">
+        <h2 class="card-title">
+          <i class="fa-paper-plane"></i>
+          5. Интеграция с Telegram
+        </h2>
+        <p>
+          Поскольку авторизация и уведомления могут быть связаны с Telegram-ботом 
+          <a href="https://t.me/Retrudio_bot" target="_blank" style="color: var(--primary); text-decoration: none; font-weight: 600;">@Retrudio_bot</a>, 
+          пользователи также обязуются соблюдать официальные условия предоставления услуг Telegram Messenger Inc.
+        </p>
+      </section>
+
+      <!-- Раздел 6 -->
+      <section class="rule-card contact-card">
+        <h2 class="card-title" style="justify-content: center; border: none; padding: 0; margin-bottom: 10px;">
+          <i class="fa-solid fa-envelope"></i>
+          6. Контакты
+        </h2>
+        <p style="color: var(--text-muted);">
+          Если у вас возникли вопросы по поводу правил, блокировок или работы сервиса, пишите нам:
+        </p>
+        <a href="mailto:servisretrudio@gmail.com" class="contact-link">
+          servisretrudio@gmail.com
+        </a>
+      </section>
+
+    </main>
+  </div>
+
+</body>
+</html>
